@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crd-syncer
+  namespace: arha-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: crd-syncer
+  template:
+    metadata:
+      labels:
+        app: crd-syncer
+    spec:
+      serviceAccountName: default
+      containers:
+        - name: syncer
+          image: hiro08081/crd-syncer:latest
+          env:
+            - name: FILE_MAP
+              value: |
+                /app/information/service.json=services:service-info
+                /app/information/serviceSpec.json=servicespecs:servicespec-info
+                /app/information/subscription.json=subscriptions:subscription-info
+                /app/information/nodestatus.json=nodestatuses:nodestatus-info
+            - name: CRD_GROUP
+              value: ha.example.com
+            - name: CRD_VERSION
+              value: v1
+            - name: CRD_NAMESPACE
+              value: arha-system
+            - name: IN_CLUSTER
+              value: "true"
+            - name: SYNC_INTERVAL
+              value: "5"
+          volumeMounts:
+            - mountPath: /app/information
+              name: information
+      volumes:
+        - name: information
+          persistentVolumeClaim:
+            claimName: arha-system-information
