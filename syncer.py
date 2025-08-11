@@ -1,35 +1,6 @@
 #!/usr/bin/env python3
 """
 crd-syncer: A lightweight JSON file ↔ Kubernetes CustomResource synchronizer.
-
-This script watches one or more JSON files on the local filesystem and keeps the
-contents in sync with corresponding Kubernetes CustomResources (CRs).  It also
-observes the CRs and writes any changes back to the files.  By default the
-synchroniser runs in‑cluster (loading a ServiceAccount token) but can fall
-back to using the local kubeconfig for development.
-
-Configuration is provided via environment variables:
-
-    FILE_MAP        Required.  A newline-separated list of mappings in the form
-                    `/path/to/file.json=plural:name`.  The plural refers to the
-                    CRD plural name (e.g. “services”), and `name` is the name of
-                    the CR instance to update (e.g. “service-info”).  Each file
-                    may map to a different CR.
-
-    CRD_GROUP       The API group for your CRDs (default: "ha.example.com").
-
-    CRD_VERSION     The version of your CRD (default: "v1").
-
-    CRD_NAMESPACE   The namespace containing the CR instances (default: "default").
-
-    IN_CLUSTER      Set to "true" if running inside a Kubernetes cluster.
-                    When false, the script will load your local kubeconfig.
-
-    SYNC_INTERVAL   Polling interval in seconds (default: "5").
-
-The synchroniser uses a simple hashing mechanism (MD5 of JSON dumps) to detect
-changes on both the file side and the CR side.  Only when a change is detected
-and it differs from the previously applied state will a sync occur.
 """
 
 import os
@@ -41,12 +12,14 @@ from typing import Dict, Tuple
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
+# ---- Guard switches (env) ----------------------------------------------------
+# CR 或 CRD 不存在時，保護本地檔：不做 CR→File
+PROTECT_LOCAL_ON_CR_ABSENT = os.getenv("PROTECT_LOCAL_ON_CR_ABSENT", "true").lower() == "true"
+# 當 CR 的 payload 是空 {} 時，是否跳過 CR→File
+SKIP_EMPTY_CR_TO_FILE = os.getenv("SKIP_EMPTY_CR_TO_FILE", "true").lower() == "true"
+
 
 def load_k8s_config(in_cluster: bool) -> None:
-    """
-    Load Kubernetes configuration.  If running in cluster, use the
-    ServiceAccount token; otherwise, fall back to the user's kubeconfig.
-    """
     if in_cluster:
         config.load_incluster_config()
     else:
@@ -54,9 +27,6 @@ def load_k8s_config(in_cluster: bool) -> None:
 
 
 def get_custom_objects_api(in_cluster: bool) -> client.CustomObjectsApi:
-    """
-    Return an initialised CustomObjectsApi.
-    """
     load_k8s_config(in_cluster)
     return client.CustomObjectsApi()
 
@@ -68,19 +38,22 @@ def read_custom_resource(
     namespace: str,
     plural: str,
     name: str,
-) -> Dict:
+) -> Tuple[Dict, bool]:
     """
-    Read a namespaced custom resource and return its "data" field.
-
-    If the resource does not exist (404), return an empty dict.
-    Raise other exceptions for unexpected failures.
+    回傳 (payload, exists)
+    - exists=False 表示 404（該 CR 不存在，或 CRD 被刪）
+    - exists=True 表示讀到物件（即使內容為 {}）
+    內容讀取自 spec。
     """
     try:
         obj = api.get_namespaced_custom_object(group, version, namespace, plural, name)
-        return obj.get("data", {}) or {}
+        val = obj.get("spec", {})
+        if isinstance(val, dict):
+            return val, True
+        return ({"raw": val} if val is not None else {}), True
     except ApiException as e:
         if e.status == 404:
-            return {}
+            return {}, False
         raise
 
 
@@ -91,68 +64,62 @@ def write_custom_resource(
     namespace: str,
     plural: str,
     name: str,
+    kind: str,
     data: Dict,
 ) -> None:
     """
-    Create or replace a namespaced custom resource with the provided data.
+    僅寫入 spec，並帶上 resourceVersion 以避免 422。
     """
     body = {
         "apiVersion": f"{group}/{version}",
-        "kind": "Data",
+        "kind": kind,
         "metadata": {"name": name},
-        "data": data,
+        "spec": data,
     }
     try:
-        api.replace_namespaced_custom_object(
-            group, version, namespace, plural, name, body
-        )
+        current = api.get_namespaced_custom_object(group, version, namespace, plural, name)
+        rv = current.get("metadata", {}).get("resourceVersion")
+        if rv:
+            body["metadata"]["resourceVersion"] = rv
+        api.patch_namespaced_custom_object(group, version, namespace, plural, name, body)
     except ApiException as e:
         if e.status == 404:
-            api.create_namespaced_custom_object(
-                group, version, namespace, plural, body
-            )
+            # 物件不存在就建立（若 CRD 被刪將仍 404；交由上層觀察 log）
+            api.create_namespaced_custom_object(group, version, namespace, plural, body)
         else:
             raise
 
 
 def file_hash(obj: Dict) -> str:
-    """
-    Return a stable MD5 hash of a Python object representing JSON data.
-    The object is dumped with sorted keys to ensure consistent hashing.
-    """
     return hashlib.md5(json.dumps(obj, sort_keys=True).encode()).hexdigest()
 
 
 def read_json_file(path: str) -> Dict:
-    """
-    Read a JSON file from disk.  If the file does not exist or is empty, return {}.
-    """
     if not os.path.exists(path):
         return {}
     try:
         with open(path, "r") as f:
-            return json.load(f)
+            content = json.load(f)
+            if isinstance(content, dict):
+                return content
+            return {"raw": content}
     except Exception:
-        # If file cannot be parsed as JSON, treat as empty to avoid crashes.
         return {}
 
 
 def write_json_file(path: str, data: Dict) -> None:
-    """
-    Write a Python dict to a JSON file with pretty formatting.
-    Create intermediate directories if needed.
-    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    output = data
+    if isinstance(data, dict) and list(data.keys()) == ["raw"]:
+        output = data["raw"]
     with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(output, f, indent=2)
 
 
-def parse_file_map(map_string: str) -> Dict[str, Tuple[str, str]]:
+def parse_file_map(map_string: str) -> Dict[str, Tuple[str, str, str]]:
     """
-    Parse the FILE_MAP string into a dictionary of file path to (plural, name).
-
-    Each line in map_string should have the format:
-        /path/to/file.json=plural:name
+    解析成: file_path -> (plural, name, kind)
+    例: /path/file.json=services:service-info:Service
     """
     mappings = {}
     for line in map_string.strip().splitlines():
@@ -160,15 +127,14 @@ def parse_file_map(map_string: str) -> Dict[str, Tuple[str, str]]:
         if not line or "=" not in line:
             continue
         file_path, cr_spec = line.split("=", 1)
-        plural, name = cr_spec.split(":", 1)
-        mappings[file_path.strip()] = (plural.strip(), name.strip())
+        parts = cr_spec.split(":")
+        plural, name = parts[:2]
+        kind = parts[2] if len(parts) > 2 else "Service"
+        mappings[file_path.strip()] = (plural.strip(), name.strip(), kind.strip())
     return mappings
 
 
 def main() -> None:
-    """
-    Main loop: repeatedly synchronise local files and CRDs based on configuration.
-    """
     file_map_str = os.environ.get("FILE_MAP")
     if not file_map_str:
         raise SystemExit("Environment variable FILE_MAP is required")
@@ -183,34 +149,50 @@ def main() -> None:
         sync_interval = 5.0
 
     file_map = parse_file_map(file_map_str)
-    # Track last applied hashes for files and CRs to avoid infinite update loops.
     last_file_hashes = {path: "" for path in file_map}
     last_cr_hashes = {path: "" for path in file_map}
 
     print("Starting crd-syncer")
     print(f"Watching {len(file_map)} file(s) with polling interval {sync_interval}s")
     while True:
-        # Acquire API inside loop to renew stale credentials if needed.
         api = get_custom_objects_api(in_cluster)
-        for file_path, (plural, name) in file_map.items():
-            # Read current data from file and CR
+        for file_path, (plural, name, kind) in file_map.items():
+            # 讀本地
             file_data = read_json_file(file_path)
-            cr_data = read_custom_resource(api, group, version, namespace, plural, name)
-            # Compute current hashes
             current_file_hash = file_hash(file_data)
-            current_cr_hash = file_hash(cr_data)
-            # Determine if file → CR update is needed
+
+            # 讀 CR（spec），並知道是否存在
+            cr_data, cr_exists = read_custom_resource(api, group, version, namespace, plural, name)
+            current_cr_hash = file_hash(cr_data) if cr_exists else last_cr_hashes[file_path]
+
+            # File → CR：本地有變、且不同於 CR
             if current_file_hash != last_file_hashes[file_path] and current_file_hash != current_cr_hash:
                 print(f"[File → CR] Updating {plural}/{name} from {file_path}")
-                write_custom_resource(api, group, version, namespace, plural, name, file_data)
-                last_file_hashes[file_path] = current_file_hash
-                last_cr_hashes[file_path] = current_file_hash
-            # Determine if CR → file update is needed
-            elif current_cr_hash != last_cr_hashes[file_path] and current_cr_hash != current_file_hash:
-                print(f"[CR → File] Updating {file_path} from {plural}/{name}")
-                write_json_file(file_path, cr_data)
-                last_file_hashes[file_path] = current_cr_hash
-                last_cr_hashes[file_path] = current_cr_hash
+                try:
+                    write_custom_resource(api, group, version, namespace, plural, name, kind, file_data)
+                    last_file_hashes[file_path] = current_file_hash
+                    last_cr_hashes[file_path] = current_file_hash
+                except ApiException as e:
+                    print(f"[Error] Write CR failed for {plural}/{name}: {e}")
+
+            # CR → File：只有在 CR 存在時才考慮；且可選擇跳過空 payload
+            elif cr_exists and current_cr_hash != last_cr_hashes[file_path] and current_cr_hash != current_file_hash:
+                if SKIP_EMPTY_CR_TO_FILE and cr_data == {}:
+                    print(f"[CR → File] Skip empty spec for {plural}/{name} (protect local).")
+                    # 不更新 last_*，避免下一輪仍判定差異；但這也表示只要 CR 還是 {}，每輪都會跳過
+                    last_cr_hashes[file_path] = current_cr_hash
+                else:
+                    print(f"[CR → File] Updating {file_path} from {plural}/{name}")
+                    write_json_file(file_path, cr_data)
+                    last_file_hashes[file_path] = current_cr_hash
+                    last_cr_hashes[file_path] = current_cr_hash
+
+            # CR 不存在（404 / CRD 可能被刪）
+            elif not cr_exists:
+                if PROTECT_LOCAL_ON_CR_ABSENT:
+                    print(f"[Guard] {plural}/{name} not found. Protect local file: {file_path}.")
+                # 不更新 last_cr_hashes，保留現況；允許 File→CR 在未來某次變動時重建該 CR
+
         time.sleep(sync_interval)
 
 

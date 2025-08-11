@@ -10,4 +10,4 @@ WORKDIR /app
 COPY syncer.py /app/syncer.py
 
 # Default command to run the syncer
-CMD ["python", "/app/syncer.py"]
+CMD ["tail", "-f", "/dev/null"]
